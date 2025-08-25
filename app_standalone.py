@@ -8,6 +8,8 @@ import hashlib
 import os
 import re
 from typing import Optional, Tuple, List
+import uuid
+from urllib.parse import urlencode
 
 # Page configuration
 st.set_page_config(
@@ -108,6 +110,17 @@ def init_database():
             )
         ''')
         
+        # Create user sessions table for persistent login
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token TEXT UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+        ''')
+        
         conn.commit()
         conn.close()
         return True
@@ -140,6 +153,65 @@ EXPENSE_CATEGORIES = [
 ]
 
 # User management functions
+def create_session_token(user_id: int) -> str:
+    """Create a secure session token for persistent login"""
+    token = str(uuid.uuid4())
+    conn = get_db_connection()
+    if not conn:
+        return ""
+    
+    try:
+        # Clean old tokens (older than 30 days)
+        conn.execute("DELETE FROM user_sessions WHERE created_at < datetime('now', '-30 days')")
+        
+        # Insert new token
+        conn.execute(
+            "INSERT INTO user_sessions (user_id, token, created_at) VALUES (?, ?, datetime('now'))",
+            (user_id, token)
+        )
+        conn.commit()
+        return token
+    except sqlite3.Error:
+        return ""
+    finally:
+        conn.close()
+
+def verify_session_token(token: str) -> Optional[int]:
+    """Verify session token and return user_id"""
+    if not token:
+        return None
+    
+    conn = get_db_connection()
+    if not conn:
+        return None
+    
+    try:
+        cursor = conn.execute(
+            "SELECT user_id FROM user_sessions WHERE token = ? AND created_at > datetime('now', '-30 days')",
+            (token,)
+        )
+        result = cursor.fetchone()
+        return result[0] if result else None
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+def get_username_by_id(user_id: int) -> str:
+    """Get username by user ID"""
+    conn = get_db_connection()
+    if not conn:
+        return ""
+    
+    try:
+        cursor = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,))
+        result = cursor.fetchone()
+        return result[0] if result else ""
+    except sqlite3.Error:
+        return ""
+    finally:
+        conn.close()
+
 def create_user(username: str, email: str, password: str) -> Optional[int]:
     """Create a new user with proper validation"""
     # Input validation
@@ -416,8 +488,37 @@ def show_login_signup():
     
     with tab1:
         st.subheader("Login to Your Account")
-        login_username = st.text_input("Username", key="login_username", max_chars=30)
-        login_password = st.text_input("Password", type="password", key="login_password", max_chars=100)
+        
+        # Add custom HTML for autofill support
+        st.markdown(
+            """
+            <style>
+            .stTextInput input {
+                autocomplete: on !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
+        
+        login_username = st.text_input(
+            "Username", 
+            key="login_username", 
+            max_chars=30,
+            help="Your username",
+            placeholder="Enter your username"
+        )
+        
+        login_password = st.text_input(
+            "Password", 
+            type="password", 
+            key="login_password", 
+            max_chars=100,
+            help="Your password",
+            placeholder="Enter your password"
+        )
+        
+        remember_me = st.checkbox("Stay logged in", help="Keep you logged in across browser sessions")
         
         if st.button("Login", type="primary"):
             if login_username.strip() and login_password:
@@ -427,6 +528,14 @@ def show_login_signup():
                         st.session_state['authenticated'] = True
                         st.session_state['user_id'] = user_id
                         st.session_state['username'] = login_username.strip()
+                        
+                        # Create persistent session if "Stay logged in" is checked
+                        if remember_me:
+                            token = create_session_token(user_id)
+                            if token:
+                                # Store token in query params for persistence
+                                st.query_params["session_token"] = token
+                        
                         st.success("Login successful!")
                         st.rerun()
                     else:
@@ -436,12 +545,56 @@ def show_login_signup():
     
     with tab2:
         st.subheader("Create New Account")
-        signup_username = st.text_input("Username", key="signup_username", max_chars=30,
-                                      help="3-30 characters, letters, numbers, dots, dashes, underscores only")
-        signup_email = st.text_input("Email", key="signup_email", max_chars=100)
-        signup_password = st.text_input("Password", type="password", key="signup_password", max_chars=100,
-                                      help="Minimum 6 characters")
-        signup_password_confirm = st.text_input("Confirm Password", type="password", key="signup_password_confirm", max_chars=100)
+        
+        # Add custom HTML for autofill support
+        st.markdown(
+            """
+            <style>
+            .stTextInput input[type="text"] {
+                autocomplete: username !important;
+            }
+            .stTextInput input[type="email"] {
+                autocomplete: email !important;
+            }
+            .stTextInput input[type="password"]:first-of-type {
+                autocomplete: new-password !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
+        
+        signup_username = st.text_input(
+            "Username", 
+            key="signup_username", 
+            max_chars=30,
+            help="3-30 characters, letters, numbers, dots, dashes, underscores only",
+            placeholder="Choose a username"
+        )
+        
+        signup_email = st.text_input(
+            "Email", 
+            key="signup_email", 
+            max_chars=100,
+            placeholder="your.email@example.com"
+        )
+        
+        signup_password = st.text_input(
+            "Password", 
+            type="password", 
+            key="signup_password", 
+            max_chars=100,
+            help="Minimum 6 characters",
+            placeholder="Create a secure password"
+        )
+        
+        signup_password_confirm = st.text_input(
+            "Confirm Password", 
+            type="password", 
+            key="signup_password_confirm", 
+            max_chars=100,
+            placeholder="Confirm your password"
+        )
         
         if st.button("Sign Up", type="primary"):
             if all([signup_username.strip(), signup_email.strip(), signup_password, signup_password_confirm]):
@@ -469,6 +622,10 @@ def main_dashboard():
         st.markdown(f"**Welcome back, {st.session_state['username']}!** Track your financial progress with detailed insights.")
     with col2:
         if st.button("Logout", type="secondary"):
+            # Clear session token from query params
+            if "session_token" in st.query_params:
+                del st.query_params["session_token"]
+            
             # Clear all session state
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
@@ -653,6 +810,26 @@ def main_dashboard():
     )
 
 # Initialize session state
+def check_persistent_login():
+    """Check for persistent login via session token"""
+    if not st.session_state.get('authenticated', False):
+        # Check for session token in query params
+        session_token = st.query_params.get("session_token")
+        if session_token:
+            user_id = verify_session_token(session_token)
+            if user_id:
+                username = get_username_by_id(user_id)
+                if username:
+                    st.session_state['authenticated'] = True
+                    st.session_state['user_id'] = user_id
+                    st.session_state['username'] = username
+                    return True
+            else:
+                # Invalid token, remove it
+                if "session_token" in st.query_params:
+                    del st.query_params["session_token"]
+    return st.session_state.get('authenticated', False)
+
 def init_session_state():
     """Initialize session state variables"""
     if 'authenticated' not in st.session_state:
@@ -674,6 +851,9 @@ def main():
     
     # Initialize session state
     init_session_state()
+    
+    # Check for persistent login
+    check_persistent_login()
     
     # Main app flow
     if not st.session_state['authenticated']:
